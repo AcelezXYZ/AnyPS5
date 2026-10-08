@@ -38,6 +38,7 @@
 namespace {
 // FreeBSD errno numbers as reported through sceNetErrnoLoc (SCE_NET_ERROR_* is 0x80410100 + errno).
 constexpr int NET_ENOENT = 2;
+constexpr int NET_EINTR = 4;
 constexpr int NET_EBADF = 9;
 constexpr int NET_EFAULT = 14;
 constexpr int NET_EINVAL = 22;
@@ -55,6 +56,8 @@ constexpr int NET_ETIMEDOUT = 60;
 constexpr int NET_ECONNREFUSED = 61;
 constexpr int NET_ERROR_BASE = static_cast<int>(0x80410100u);
 constexpr int NET_ERROR_RESOLVER_ENODNS = static_cast<int>(0x804101E1u);
+constexpr std::uint32_t NET_RESOLVER_ABORT_FLAG_NTOA_PRESERVATION = 0x1;
+constexpr std::uint32_t NET_RESOLVER_ABORT_FLAG_ATON_PRESERVATION = 0x2;
 
 constexpr int NET_AF_INET = 2;
 constexpr int NET_AF_INET6 = 28;
@@ -210,6 +213,7 @@ std::map<int, std::map<int, NetEpollEvent>> g_epoll_socks;
 std::set<int> g_epoll_aborted;
 std::set<int> g_pools;
 std::map<int, int> g_resolvers;
+std::map<int, std::uint32_t> g_resolver_aborts;
 int g_next_sock = 32;
 int g_next_epoll = 0x4000;
 int g_next_pool = 1;
@@ -230,6 +234,17 @@ void set_resolver_error(int rid, int error) {
     std::lock_guard<std::mutex> lk(g_mutex);
     const auto resolver = g_resolvers.find(rid);
     if (resolver != g_resolvers.end()) resolver->second = error;
+}
+
+int begin_resolver_lookup(int rid, std::uint32_t preservation) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    const auto resolver = g_resolvers.find(rid);
+    if (resolver == g_resolvers.end()) return fail(NET_EBADF);
+    const auto pending = g_resolver_aborts.find(rid);
+    if (pending == g_resolver_aborts.end() || (pending->second & preservation) == 0) return 0;
+    pending->second &= ~preservation;
+    resolver->second = NET_ERROR_BASE | NET_EINTR;
+    return fail(NET_EINTR);
 }
 
 void log_soft(const char* func, const char* what) {
@@ -1046,6 +1061,7 @@ int APS5_VABI sceNetResolverCreate(const char* name, int memid, int flags) {
 
 int APS5_VABI sceNetResolverDestroy(int rid) {
     std::lock_guard<std::mutex> lk(g_mutex);
+    g_resolver_aborts.erase(rid);
     return g_resolvers.erase(rid) != 0 ? 0 : fail(NET_EBADF);
 }
 
@@ -1054,10 +1070,7 @@ int APS5_VABI sceNetResolverStartNtoa(int rid, const char* hostname, void* addr,
     (void)retry;
     (void)flags;
     if (!hostname || !addr) return fail(NET_EINVAL);
-    {
-        std::lock_guard<std::mutex> lk(g_mutex);
-        if (g_resolvers.count(rid) == 0) return fail(NET_EBADF);
-    }
+    if (const int begun = begin_resolver_lookup(rid, NET_RESOLVER_ABORT_FLAG_NTOA_PRESERVATION); begun != 0) return begun;
     if (!initialize_sockets()) return fail(5);
     addrinfo hints{};
     hints.ai_family = AF_INET;
@@ -1081,10 +1094,7 @@ int APS5_VABI sceNetResolverStartAton(int rid, const void* addr, char* hostname,
     (void)retry;
     (void)flags;
     if (!addr || !hostname || len <= 0) return fail(NET_EINVAL);
-    {
-        std::lock_guard<std::mutex> lk(g_mutex);
-        if (g_resolvers.count(rid) == 0) return fail(NET_EBADF);
-    }
+    if (const int begun = begin_resolver_lookup(rid, NET_RESOLVER_ABORT_FLAG_ATON_PRESERVATION); begun != 0) return begun;
     if (!initialize_sockets()) return fail(5);
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -1110,8 +1120,14 @@ int APS5_VABI sceNetResolverGetError(int rid, int* status) {
     return 0;
 }
 
-int APS5_VABI sceNetResolverAbort(void) {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceNetResolverAbort(int rid, int flags) {
+    const auto preservation = static_cast<std::uint32_t>(flags);
+    if ((preservation & ~(NET_RESOLVER_ABORT_FLAG_NTOA_PRESERVATION | NET_RESOLVER_ABORT_FLAG_ATON_PRESERVATION)) != 0) {
+        throw std::runtime_error("sceNetResolverAbort: unknown abort flags");
+    }
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (g_resolvers.count(rid) == 0) return fail(NET_EBADF);
+    if (preservation != 0) g_resolver_aborts[rid] |= preservation;
     return 0;
 }
 

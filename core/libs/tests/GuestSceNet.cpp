@@ -58,6 +58,8 @@ struct NetMsghdr {
 };
 
 extern "C" {
+int APS5_VABI sceNetResolverAbort(int, int);
+int APS5_VABI sceNetResolverStartAton(int, const void*, char*, int, int, int, int);
 std::int64_t APS5_VABI sceNetSendmsg(int, const NetMsghdr*, int);
 std::int64_t APS5_VABI sceNetRecvmsg(int, NetMsghdr*, int);
 }
@@ -304,6 +306,33 @@ int main() {
     resolver_error = -1;
     Require(sceNetResolverGetError(resolver, &resolver_error) == static_cast<int>(0x80410109) &&
         *sceNetErrnoLoc() == 9 && resolver_error == -1);
+
+    const int aborted = sceNetResolverCreate("guest-abort", 0, 0);
+    Require(aborted >= 0);
+    std::array<std::uint8_t, 4> loopback{};
+    Require(sceNetResolverAbort(aborted, 0) == 0);
+    Require(sceNetResolverStartNtoa(aborted, "localhost", loopback.data(), 5000000, 1, 0) == 0 && loopback[0] == 127);
+    Require(sceNetResolverAbort(aborted, 1) == 0);
+    loopback = {};
+    Require(Failed(sceNetResolverStartNtoa(aborted, "localhost", loopback.data(), 5000000, 1, 0), 4));
+    Require(loopback[0] == 0);
+    Require(sceNetResolverGetError(aborted, &resolver_error) == 0 && resolver_error == static_cast<int>(0x80410104));
+    Require(sceNetResolverStartNtoa(aborted, "localhost", loopback.data(), 5000000, 1, 0) == 0 && loopback[0] == 127);
+    Require(sceNetResolverGetError(aborted, &resolver_error) == 0 && resolver_error == 0);
+    Require(sceNetResolverAbort(aborted, 2) == 0);
+    Require(sceNetResolverStartNtoa(aborted, "localhost", loopback.data(), 5000000, 1, 0) == 0);
+    char host_name[64]{};
+    Require(Failed(sceNetResolverStartAton(aborted, loopback.data(), host_name, sizeof(host_name), 5000000, 1, 0), 4));
+    Require(host_name[0] == 0);
+    Require(sceNetResolverAbort(aborted, 3) == 0);
+    Require(Failed(sceNetResolverStartNtoa(aborted, nullptr, loopback.data(), 5000000, 1, 0), 22));
+    Require(Failed(sceNetResolverStartNtoa(aborted, "localhost", loopback.data(), 5000000, 1, 0), 4));
+    Require(Failed(sceNetResolverStartAton(aborted, loopback.data(), host_name, sizeof(host_name), 5000000, 1, 0), 4));
+    bool abort_threw = false;
+    try { sceNetResolverAbort(aborted, 4); } catch (const std::runtime_error&) { abort_threw = true; }
+    Require(abort_threw);
+    Require(sceNetResolverDestroy(aborted) == 0);
+    Require(Failed(sceNetResolverAbort(aborted, 1), 9));
 
     std::array<std::uint8_t, 16> ipv6{};
     Require(sceNetInetPton(28, "::1", ipv6.data()) == 1);
