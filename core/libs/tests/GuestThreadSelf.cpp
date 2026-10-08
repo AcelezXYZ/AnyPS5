@@ -1,6 +1,9 @@
 #include "SceTypes.hpp"
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
+#include <thread>
 
 extern "C" {
 int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, PthreadEntry entry, void* arg, const char* name);
@@ -12,6 +15,7 @@ void APS5_VABI scePthreadTestcancel();
 void APS5_VABI pthread_testcancel_nid_postfix(void);
 int APS5_VABI scePthreadSetcancelstate(int state, int* old_state);
 int APS5_VABI scePthreadSetcanceltype(int type, int* old_type);
+int APS5_VABI scePthreadCancel(Pthread thread);
 int APS5_VABI scePthreadMutexattrInit(PthreadMutexattr* attr);
 int APS5_VABI scePthreadMutexattrDestroy(PthreadMutexattr* attr);
 int APS5_VABI scePthreadMutexattrSettype(PthreadMutexattr* attr, int type);
@@ -42,11 +46,147 @@ static constexpr int SCE_OK = 0;
 static constexpr int SCE_KERNEL_ERROR_EINVAL = 0x80020016;
 static constexpr int SCE_KERNEL_ERROR_EPERM = 0x80020001;
 static constexpr int MUTEX_TYPE_RECURSIVE = 2;
-static constexpr int PTHREAD_CANCEL_ENABLE = 0;
-static constexpr int PTHREAD_CANCEL_ASYNCHRONOUS = 2;
+static constexpr int SCE_KERNEL_ERROR_ESRCH = 0x80020003;
+static constexpr int CANCEL_STATE_ENABLE = 0;
+static constexpr int CANCEL_STATE_DISABLE = 1;
+static constexpr int CANCEL_TYPE_DEFERRED = 0;
+static constexpr int CANCEL_TYPE_ASYNCHRONOUS = 2;
 static constexpr std::intptr_t WorkerRetval = 0x1234;
+static constexpr std::intptr_t CancelWorkerRetval = 0x55;
+static void* const PthreadCanceled = reinterpret_cast<void*>(std::uintptr_t{1});
 
 static void Require(bool value) { if (!value) std::abort(); }
+
+struct CancelContext {
+    Pthread thread = nullptr;
+    std::atomic<bool> ready{false};
+    std::atomic<bool> go{false};
+    std::atomic<bool> beforeCancelPoint{false};
+    std::atomic<bool> afterCancelPoint{false};
+    int setupResult = -1;
+    int oldValue = -1;
+};
+
+static void WaitFor(const std::atomic<bool>& flag) {
+    while (!flag.load(std::memory_order_acquire)) std::this_thread::yield();
+}
+
+static void* APS5_VABI DeferredCancelWorker(void* arg) {
+    auto& context = *static_cast<CancelContext*>(arg);
+    context.ready.store(true, std::memory_order_release);
+    WaitFor(context.go);
+    context.beforeCancelPoint.store(true, std::memory_order_release);
+    scePthreadTestcancel();
+    context.afterCancelPoint.store(true, std::memory_order_release);
+    return reinterpret_cast<void*>(CancelWorkerRetval);
+}
+
+static void* APS5_VABI DisabledCancelWorker(void* arg) {
+    auto& context = *static_cast<CancelContext*>(arg);
+    context.setupResult = scePthreadSetcancelstate(CANCEL_STATE_DISABLE, &context.oldValue);
+    context.ready.store(true, std::memory_order_release);
+    WaitFor(context.go);
+    scePthreadTestcancel();
+    context.beforeCancelPoint.store(true, std::memory_order_release);
+    scePthreadSetcancelstate(CANCEL_STATE_ENABLE, nullptr);
+    context.afterCancelPoint.store(true, std::memory_order_release);
+    return reinterpret_cast<void*>(CancelWorkerRetval);
+}
+
+static void* APS5_VABI SelfAsyncCancelWorker(void* arg) {
+    auto& context = *static_cast<CancelContext*>(arg);
+    context.setupResult = scePthreadSetcanceltype(CANCEL_TYPE_ASYNCHRONOUS, &context.oldValue);
+    context.beforeCancelPoint.store(true, std::memory_order_release);
+    scePthreadCancel(scePthreadSelf());
+    context.afterCancelPoint.store(true, std::memory_order_release);
+    return reinterpret_cast<void*>(CancelWorkerRetval);
+}
+
+static void* APS5_VABI SelfDeferredCancelWorker(void* arg) {
+    auto& context = *static_cast<CancelContext*>(arg);
+    context.setupResult = scePthreadCancel(scePthreadSelf());
+    context.beforeCancelPoint.store(true, std::memory_order_release);
+    scePthreadTestcancel();
+    context.afterCancelPoint.store(true, std::memory_order_release);
+    return reinterpret_cast<void*>(CancelWorkerRetval);
+}
+
+static void* APS5_VABI AsyncTargetWorker(void* arg) {
+    auto& context = *static_cast<CancelContext*>(arg);
+    context.setupResult = scePthreadSetcanceltype(CANCEL_TYPE_ASYNCHRONOUS, nullptr);
+    context.ready.store(true, std::memory_order_release);
+    WaitFor(context.go);
+    scePthreadSetcanceltype(CANCEL_TYPE_DEFERRED, nullptr);
+    scePthreadTestcancel();
+    context.afterCancelPoint.store(true, std::memory_order_release);
+    return reinterpret_cast<void*>(CancelWorkerRetval);
+}
+
+static void* APS5_VABI FinishingWorker(void*) {
+    return reinterpret_cast<void*>(CancelWorkerRetval);
+}
+
+static void* RunCancelWorker(PthreadEntry entry, CancelContext& context, bool cancelFromMain) {
+    Require(scePthreadCreate(&context.thread, nullptr, entry, &context, nullptr) == SCE_OK);
+    if (cancelFromMain) {
+        WaitFor(context.ready);
+        Require(scePthreadCancel(context.thread) == SCE_OK);
+        context.go.store(true, std::memory_order_release);
+    }
+    void* result = nullptr;
+    Require(scePthreadJoin(context.thread, &result) == SCE_OK);
+    return result;
+}
+
+static void CheckCancellation() {
+    {
+        CancelContext context;
+        Require(RunCancelWorker(DeferredCancelWorker, context, true) == PthreadCanceled);
+        Require(context.beforeCancelPoint.load() && !context.afterCancelPoint.load());
+    }
+    {
+        CancelContext context;
+        Require(RunCancelWorker(DisabledCancelWorker, context, true) == PthreadCanceled);
+        Require(context.setupResult == SCE_OK && context.oldValue == CANCEL_STATE_ENABLE);
+        Require(context.beforeCancelPoint.load() && !context.afterCancelPoint.load());
+    }
+    {
+        CancelContext context;
+        Require(RunCancelWorker(SelfAsyncCancelWorker, context, false) == PthreadCanceled);
+        Require(context.setupResult == SCE_OK && context.oldValue == CANCEL_TYPE_DEFERRED);
+        Require(context.beforeCancelPoint.load() && !context.afterCancelPoint.load());
+    }
+    {
+        CancelContext context;
+        Require(RunCancelWorker(SelfDeferredCancelWorker, context, false) == PthreadCanceled);
+        Require(context.setupResult == SCE_OK);
+        Require(context.beforeCancelPoint.load() && !context.afterCancelPoint.load());
+    }
+    {
+        CancelContext context;
+        Require(scePthreadCreate(&context.thread, nullptr, AsyncTargetWorker, &context, nullptr) == SCE_OK);
+        WaitFor(context.ready);
+        bool threw = false;
+        try { scePthreadCancel(context.thread); } catch (const std::runtime_error&) { threw = true; }
+        Require(threw);
+        context.go.store(true, std::memory_order_release);
+        void* result = nullptr;
+        Require(scePthreadJoin(context.thread, &result) == SCE_OK);
+        Require(result == reinterpret_cast<void*>(CancelWorkerRetval));
+        Require(context.setupResult == SCE_OK && context.afterCancelPoint.load());
+    }
+    {
+        Pthread finishing = nullptr;
+        Require(scePthreadCreate(&finishing, nullptr, FinishingWorker, nullptr, nullptr) == SCE_OK);
+        while (scePthreadCancel(finishing) != SCE_KERNEL_ERROR_ESRCH) std::this_thread::yield();
+        void* result = nullptr;
+        Require(scePthreadJoin(finishing, &result) == SCE_OK);
+        Require(result == reinterpret_cast<void*>(CancelWorkerRetval));
+    }
+    int unchanged = 7;
+    Require(scePthreadSetcancelstate(2, &unchanged) == SCE_KERNEL_ERROR_EINVAL && unchanged == 7);
+    Require(scePthreadSetcanceltype(1, &unchanged) == SCE_KERNEL_ERROR_EINVAL && unchanged == 7);
+}
 
 struct WorkerContext {
     Pthread thread = nullptr;
@@ -65,11 +205,11 @@ static void* APS5_VABI Worker(void* arg) {
     context.unlockResult = scePthreadMutexUnlock(context.mutex);
     int oldState = -1;
     int oldType = -1;
-    context.testcancelReturned = scePthreadSetcancelstate(PTHREAD_CANCEL_ENABLE, &oldState) == SCE_OK &&
-        scePthreadSetcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &oldType) == SCE_OK;
+    context.testcancelReturned = scePthreadSetcancelstate(CANCEL_STATE_ENABLE, &oldState) == SCE_OK &&
+        scePthreadSetcanceltype(CANCEL_TYPE_ASYNCHRONOUS, &oldType) == SCE_OK;
     scePthreadTestcancel();
     pthread_testcancel_nid_postfix();
-    context.testcancelReturned = context.testcancelReturned && oldState == PTHREAD_CANCEL_ENABLE;
+    context.testcancelReturned = context.testcancelReturned && oldState == CANCEL_STATE_ENABLE;
     scePthreadExit(reinterpret_cast<void*>(WorkerRetval));
     return nullptr;
 }
@@ -110,6 +250,7 @@ int main() {
 
     scePthreadTestcancel();
     pthread_testcancel_nid_postfix();
+    CheckCancellation();
 
     Require(scePthreadMutexUnlock(&mutex) == SCE_OK);
     Require(scePthreadMutexDestroy(&mutex) == SCE_OK);

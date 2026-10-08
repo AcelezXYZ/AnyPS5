@@ -91,6 +91,9 @@ struct PthreadPrivate {
     std::mutex nameLock;
     std::string name;
     std::atomic<bool> _finished;
+    std::atomic<bool> cancelPending{false};
+    std::atomic<bool> cancelEnabled{true};
+    std::atomic<bool> cancelAsync{false};
     void* _retval;
     bool _detached;
     bool _adopted;

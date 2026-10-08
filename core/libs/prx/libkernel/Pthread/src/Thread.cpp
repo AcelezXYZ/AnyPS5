@@ -429,10 +429,25 @@ void APS5_VABI scePthreadYield() {
     std::this_thread::yield();
 }
 
+static constexpr int CANCEL_STATE_ENABLE = 0;
+static constexpr int CANCEL_STATE_DISABLE = 1;
+static constexpr int CANCEL_TYPE_DEFERRED = 0;
+static constexpr int CANCEL_TYPE_ASYNCHRONOUS = 2;
+
+static void TestCancel(PthreadPrivate* self) {
+    if (self->cancelPending.load(std::memory_order_acquire) && self->cancelEnabled.load(std::memory_order_acquire))
+        scePthreadExit(reinterpret_cast<void*>(std::uintptr_t{1}));
+}
+
 int APS5_VABI scePthreadCancel(Pthread thread) {
- (void)thread;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+    if (!thread) throw std::runtime_error("scePthreadCancel: null thread");
+    if (thread->_finished.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
+    const bool self = thread == currentThread;
+    if (!self && thread->cancelAsync.load(std::memory_order_acquire) && thread->cancelEnabled.load(std::memory_order_acquire))
+        throw std::runtime_error("scePthreadCancel: asynchronous cancellation of another thread is not implemented");
+    thread->cancelPending.store(true, std::memory_order_release);
+    if (self && thread->cancelAsync.load(std::memory_order_acquire)) TestCancel(thread);
+    return SCE_OK;
 }
 
 int APS5_VABI scePthreadEqual(Pthread thread1, Pthread thread2) {
@@ -491,20 +506,25 @@ int APS5_VABI scePthreadSetaffinity(Pthread thread, KernelCpumask mask) {
 }
 
 int APS5_VABI scePthreadSetcancelstate(int state, int* old_state) {
-    static thread_local int cancelState = 0;
-    if (old_state) *old_state = cancelState;
-    cancelState = state;
+    if (state != CANCEL_STATE_ENABLE && state != CANCEL_STATE_DISABLE) return SCE_KERNEL_ERROR_EINVAL;
+    auto* self = scePthreadSelf();
+    const bool wasEnabled = self->cancelEnabled.exchange(state == CANCEL_STATE_ENABLE, std::memory_order_acq_rel);
+    if (old_state) *old_state = wasEnabled ? CANCEL_STATE_ENABLE : CANCEL_STATE_DISABLE;
+    if (state == CANCEL_STATE_ENABLE) TestCancel(self);
     return SCE_OK;
 }
 
 int APS5_VABI scePthreadSetcanceltype(int type, int* old_type) {
-    static thread_local int cancelType = 0;
-    if (old_type) *old_type = cancelType;
-    cancelType = type;
+    if (type != CANCEL_TYPE_DEFERRED && type != CANCEL_TYPE_ASYNCHRONOUS) return SCE_KERNEL_ERROR_EINVAL;
+    auto* self = scePthreadSelf();
+    const bool wasAsync = self->cancelAsync.exchange(type == CANCEL_TYPE_ASYNCHRONOUS, std::memory_order_acq_rel);
+    if (old_type) *old_type = wasAsync ? CANCEL_TYPE_ASYNCHRONOUS : CANCEL_TYPE_DEFERRED;
+    if (type == CANCEL_TYPE_ASYNCHRONOUS) TestCancel(self);
     return SCE_OK;
 }
 
 void APS5_VABI scePthreadTestcancel() {
+    TestCancel(scePthreadSelf());
 }
 
 int APS5_VABI scePthreadSetprio(Pthread thread, int prio) {
