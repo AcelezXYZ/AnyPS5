@@ -6,6 +6,7 @@
 #include <cstring>
 
 extern "C" {
+int APS5_VABI sceNpGetUserIdByAccountId(uint64_t accountId, int* userId);
 int APS5_VABI sceNpGetNpId(int user_id, NpId* np_id);
 }
 
@@ -24,6 +25,11 @@ void Require(bool condition, const char* message) {
 }
 
 int main() {
+    int userId = 0x7a7a;
+    Require(sceNpGetUserIdByAccountId(0x1234, &userId) == SignedOut, "sceNpGetUserIdByAccountId must report the account as signed out");
+    Require(userId == 0x7a7a, "sceNpGetUserIdByAccountId must leave the user id untouched");
+    Require(sceNpGetUserIdByAccountId(0, &userId) == InvalidArgument, "sceNpGetUserIdByAccountId must reject account id 0");
+    Require(sceNpGetUserIdByAccountId(0x1234, nullptr) == InvalidArgument, "sceNpGetUserIdByAccountId must reject a null user id");
     NpId npId{};
     std::memset(&npId, 0x5a, sizeof(npId));
     NpId untouched{};
